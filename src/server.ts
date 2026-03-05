@@ -353,7 +353,7 @@ server.registerTool(
         .boolean()
         .optional()
         .default(false)
-        .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process."),
+        .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process. IMPORTANT: Do NOT add setTimeout/self-close timers in background scripts — the process must stay alive until the timeout detaches it. For server+fetch patterns, prefer putting both server and fetch in ONE ctx_execute call instead of using background."),
       intent: z
         .string()
         .optional()
@@ -379,43 +379,56 @@ server.registerTool(
       // For JS/TS: wrap in async IIFE with fetch + http/https interceptors to track network bytes
       let instrumentedCode = code;
       if (language === "javascript" || language === "typescript") {
+        // Wrap user code in a closure that shadows CJS require with http/https interceptor.
+        // globalThis.require does NOT work because CJS require is module-scoped, not global.
+        // The closure approach (function(__cm_req){ var require=...; })(require) correctly
+        // shadows the CJS require for all code inside, including __cm_main().
         instrumentedCode = `
 let __cm_net=0;
+// Report network bytes on process exit — works with both promise and callback patterns.
+// process.on('exit') fires after all I/O completes, unlike .finally() which fires
+// when __cm_main() resolves (immediately for callback-based http.get without await).
+process.on('exit',()=>{if(__cm_net>0)try{process.stderr.write('__CM_NET__:'+__cm_net+'\\n')}catch{}});
+;(function(__cm_req){
 // Intercept globalThis.fetch
 const __cm_f=globalThis.fetch;
 globalThis.fetch=async(...a)=>{const r=await __cm_f(...a);
 try{const cl=r.clone();const b=await cl.arrayBuffer();__cm_net+=b.byteLength}catch{}
 return r};
-// Intercept http/https .get and .request to track Node-style network I/O
-(function(){
-  try{
-    for(const mod of ['http','https']){
-      const m=require(mod);
-      const origGet=m.get,origReq=m.request;
-      function wrap(origFn){return function(...a){
-        const req=origFn.apply(m,a);
-        const origOn=req.on.bind(req);
-        req.on=function(ev,cb,...r){
-          if(ev==='response'){
-            return origOn(ev,function(res){
-              res.on('data',function(c){__cm_net+=c.length});
-              cb(res);
-            },...r);
-          }
-          return origOn(ev,cb,...r);
-        };
-        return req;
-      }}
-      m.get=wrap(origGet);m.request=wrap(origReq);
-    }
-  }catch{}
-})();
+// Shadow CJS require with http/https network tracking.
+const __cm_hc=new Map();
+const __cm_hm=new Set(['http','https','node:http','node:https']);
+function __cm_wf(m,origFn){return function(...a){
+  const li=a.length-1;
+  if(li>=0&&typeof a[li]==='function'){const oc=a[li];a[li]=function(res){
+    res.on('data',function(c){__cm_net+=c.length});oc(res);};}
+  const req=origFn.apply(m,a);
+  const oOn=req.on.bind(req);
+  req.on=function(ev,cb,...r){
+    if(ev==='response'){return oOn(ev,function(res){
+      res.on('data',function(c){__cm_net+=c.length});cb(res);
+    },...r);}
+    return oOn(ev,cb,...r);
+  };
+  return req;
+}}
+var require=__cm_req?function(id){
+  const m=__cm_req(id);
+  if(!__cm_hm.has(id))return m;
+  const k=id.replace('node:','');
+  if(__cm_hc.has(k))return __cm_hc.get(k);
+  const w=Object.create(m);
+  if(typeof m.get==='function')w.get=__cm_wf(m,m.get);
+  if(typeof m.request==='function')w.request=__cm_wf(m,m.request);
+  __cm_hc.set(k,w);return w;
+}:__cm_req;
+if(__cm_req){if(__cm_req.resolve)require.resolve=__cm_req.resolve;
+if(__cm_req.cache)require.cache=__cm_req.cache;}
 async function __cm_main(){
 ${code}
 }
-__cm_main().catch(e=>{console.error(e);process.exitCode=1}).finally(()=>{
-if(__cm_net>0)process.stderr.write('__CM_NET__:'+__cm_net+'\\n');
-});`;
+__cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
+})(typeof require!=='undefined'?require:null);`;
       }
       const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
 
@@ -1693,8 +1706,9 @@ async function main() {
     console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
   }
 
-  // Clean up own DB on shutdown
+  // Clean up own DB + backgrounded processes on shutdown
   const shutdown = () => {
+    executor.cleanupBackgrounded();
     if (_store) _store.cleanup();
   };
   process.on("exit", shutdown);

@@ -43,6 +43,9 @@ export class PolyglotExecutor {
   #projectRoot: string;
   #runtimes: RuntimeMap;
 
+  /** PIDs of backgrounded processes — killed on cleanup to prevent zombies. */
+  #backgroundedPids = new Set<number>();
+
   constructor(opts?: {
     maxOutputBytes?: number;
     hardCapBytes?: number;
@@ -57,6 +60,16 @@ export class PolyglotExecutor {
 
   get runtimes(): RuntimeMap {
     return { ...this.#runtimes };
+  }
+
+  /** Kill all backgrounded processes to prevent zombie/port-conflict issues. */
+  cleanupBackgrounded(): void {
+    for (const pid of this.#backgroundedPids) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch { /* already dead */ }
+    }
+    this.#backgroundedPids.clear();
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
@@ -214,6 +227,7 @@ export class PolyglotExecutor {
         if (background) {
           // Background mode: detach process, return partial output, keep running
           resolved = true;
+          if (proc.pid) this.#backgroundedPids.add(proc.pid);
           proc.unref();
           proc.stdout!.destroy();
           proc.stderr!.destroy();
@@ -414,6 +428,24 @@ export class PolyglotExecutor {
     for (const key of passthrough) {
       if (process.env[key]) {
         env[key] = process.env[key]!;
+      }
+    }
+
+    // Ensure SSL_CERT_FILE is set so Python/Ruby HTTPS works in sandbox.
+    // On macOS, it's typically unset (Python uses its own bundle or none),
+    // causing urllib/requests to fail with SSL cert verification errors.
+    if (!env["SSL_CERT_FILE"]) {
+      const certPaths = isWin ? [] : [
+        "/etc/ssl/cert.pem",                         // macOS, some Linux
+        "/etc/ssl/certs/ca-certificates.crt",         // Debian/Ubuntu/Alpine
+        "/etc/pki/tls/certs/ca-bundle.crt",           // RHEL/CentOS/Fedora
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // Fedora alt
+      ];
+      for (const p of certPaths) {
+        if (existsSync(p)) {
+          env["SSL_CERT_FILE"] = p;
+          break;
+        }
       }
     }
 

@@ -109,6 +109,22 @@ describe("Bash: Redirected Commands", () => {
     });
     assertRedirect(result, "context-mode");
   });
+
+  test("Bash + ./gradlew build: redirected to execute sandbox (Issue #38)", () => {
+    const result = runHook({
+      tool_name: "Bash",
+      tool_input: { command: "./gradlew build --info" },
+    });
+    assertRedirect(result, "Build tool redirected");
+  });
+
+  test("Bash + mvn package: redirected to execute sandbox (Issue #38)", () => {
+    const result = runHook({
+      tool_name: "Bash",
+      tool_input: { command: "mvn clean package -DskipTests" },
+    });
+    assertRedirect(result, "Build tool redirected");
+  });
 });
 
 describe("Bash: Allowed Commands", () => {
